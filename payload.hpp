@@ -80,15 +80,11 @@ struct XdpScreencastPortal {
     portal = xdp_portal_new();
     XdpOutputType output_type = (XdpOutputType)(XdpOutputType::XDP_OUTPUT_MONITOR | XdpOutputType::XDP_OUTPUT_WINDOW);
     XdpScreencastFlags cast_flags = XdpScreencastFlags::XDP_SCREENCAST_FLAG_NONE;
-    XdpCursorMode cursor_mode = get_current_session_type() == SessionType::Wayland ? 
-                                XDP_CURSOR_MODE_EMBEDDED :
-                                XDP_CURSOR_MODE_HIDDEN;
-    
-    // hyprland cursor mode workaround.
-    // as hyprland does not support XDP_CURSOR_MODE_HIDDEN, we simply use XDP_CURSOR_MODE_EMBEDDED for it
-    if (get_current_de_type() == DEType::Hyprland) {
-      cursor_mode = XDP_CURSOR_MODE_EMBEDDED;
-    }
+
+    // Always use EMBEDDED cursor mode to show the cursor in screenshare
+    // Even though we set XDG_SESSION_TYPE=x11 for QQ, we're actually running on Wayland
+    XdpCursorMode cursor_mode = XDP_CURSOR_MODE_EMBEDDED;
+
     XdpPersistMode persist_mode = XdpPersistMode::XDP_PERSIST_MODE_NONE;
     xdp_portal_create_screencast_session(
       portal,
@@ -204,29 +200,27 @@ struct PipewireScreenCast {
     };
     pw_stream_add_listener(stream, &listener, &stream_events, this);
 
-    // set up stream params
+    // set up stream params with multiple format options
     this->param_buffer.reset(new uint8_t[param_buffer_size]);
     b = SPA_POD_BUILDER_INIT(param_buffer.get(), param_buffer_size);
-    
-    auto vidsize_default = SPA_RECTANGLE(320, 240);
+
+    auto vidsize_default = SPA_RECTANGLE(1920, 1080);
     auto vidsize_min = SPA_RECTANGLE(1, 1);
     auto vidsize_max = SPA_RECTANGLE(DEFAULT_FB_ALLOC_WIDTH, DEFAULT_FB_ALLOC_HEIGHT);
-    
-    auto vidframerate_default = SPA_FRACTION(20, 1);
+
+    auto vidframerate_default = SPA_FRACTION(30, 1);
     auto vidframerate_min = SPA_FRACTION(0, 1);
     auto vidframerate_max = SPA_FRACTION(1000, 1);
-    params[0] = reinterpret_cast<spa_pod*>(spa_pod_builder_add_object(&b,
+
+    // Provide multiple format options to increase compatibility
+    int n_params = 0;
+
+    // Format 1: BGRx (most common)
+    params[n_params++] = reinterpret_cast<spa_pod*>(spa_pod_builder_add_object(&b,
                 SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
                 SPA_FORMAT_mediaType,       SPA_POD_Id(SPA_MEDIA_TYPE_video),
                 SPA_FORMAT_mediaSubtype,    SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-                SPA_FORMAT_VIDEO_format,    SPA_POD_CHOICE_ENUM_Id(6,
-                                                SPA_VIDEO_FORMAT_RGB,
-                                                SPA_VIDEO_FORMAT_BGR,
-                                                SPA_VIDEO_FORMAT_RGBA,
-                                                SPA_VIDEO_FORMAT_BGRA,
-                                                SPA_VIDEO_FORMAT_RGBx,
-                                                SPA_VIDEO_FORMAT_BGRx
-                                                ),
+                SPA_FORMAT_VIDEO_format,    SPA_POD_Id(SPA_VIDEO_FORMAT_BGRx),
                 SPA_FORMAT_VIDEO_size,      SPA_POD_CHOICE_RANGE_Rectangle(
                                                 &vidsize_default,
                                                 &vidsize_min,
@@ -235,8 +229,39 @@ struct PipewireScreenCast {
                                                 &vidframerate_default,
                                                 &vidframerate_min,
                                                 &vidframerate_max)));
-    
-    pw_stream_connect(stream, PW_DIRECTION_INPUT, PW_ID_ANY, pw_stream_flags(PW_STREAM_FLAG_AUTOCONNECT |  PW_STREAM_FLAG_MAP_BUFFERS), params, 1);
+
+    // Format 2: BGRA
+    params[n_params++] = reinterpret_cast<spa_pod*>(spa_pod_builder_add_object(&b,
+                SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+                SPA_FORMAT_mediaType,       SPA_POD_Id(SPA_MEDIA_TYPE_video),
+                SPA_FORMAT_mediaSubtype,    SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+                SPA_FORMAT_VIDEO_format,    SPA_POD_Id(SPA_VIDEO_FORMAT_BGRA),
+                SPA_FORMAT_VIDEO_size,      SPA_POD_CHOICE_RANGE_Rectangle(
+                                                &vidsize_default,
+                                                &vidsize_min,
+                                                &vidsize_max),
+                SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
+                                                &vidframerate_default,
+                                                &vidframerate_min,
+                                                &vidframerate_max)));
+
+    // Format 3: RGBx
+    params[n_params++] = reinterpret_cast<spa_pod*>(spa_pod_builder_add_object(&b,
+                SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+                SPA_FORMAT_mediaType,       SPA_POD_Id(SPA_MEDIA_TYPE_video),
+                SPA_FORMAT_mediaSubtype,    SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+                SPA_FORMAT_VIDEO_format,    SPA_POD_Id(SPA_VIDEO_FORMAT_RGBx),
+                SPA_FORMAT_VIDEO_size,      SPA_POD_CHOICE_RANGE_Rectangle(
+                                                &vidsize_default,
+                                                &vidsize_min,
+                                                &vidsize_max),
+                SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(
+                                                &vidframerate_default,
+                                                &vidframerate_min,
+                                                &vidframerate_max)));
+
+    fprintf(stderr, "%s", yellow_text("[payload pw] connecting stream with " + std::to_string(n_params) + " format options\n").c_str());
+    pw_stream_connect(stream, PW_DIRECTION_INPUT, PW_ID_ANY, pw_stream_flags(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS), params, n_params);
   }
 
   static void registry_global(void *data, uint32_t id, uint32_t permissions, const char *type, uint32_t version, const struct spa_dict *props) {
@@ -282,10 +307,10 @@ private:
   pw_registry *registry;
   spa_hook registry_listener;
   std::unique_ptr<uint8_t[]> param_buffer{nullptr};
-  static constexpr size_t param_buffer_size = 1024;
+  static constexpr size_t param_buffer_size = 2048;
   spa_pod_builder b;
   spa_hook listener;
-  const spa_pod* params[1];
+  const spa_pod* params[8];
   pw_stream_events stream_events;
   std::chrono::time_point<std::chrono::high_resolution_clock> last_frame_time;
   int counter{0};

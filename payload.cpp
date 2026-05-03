@@ -26,7 +26,8 @@ struct CandidateWindowInfo{
 
 std::vector<CandidateWindowInfo> x11_sanitizer_get_targets(
   Display* display,
-  XWindow_t root_window
+  XWindow_t root_window,
+  const std::vector<std::tuple<int, int>>& screen_sizes
 ){
   // hunt for direct children of root window that has override_redirect set to true
   Window root_return, parent_return;
@@ -37,21 +38,17 @@ std::vector<CandidateWindowInfo> x11_sanitizer_get_targets(
     fprintf(stderr, "%s", red_text("[x11_sanitizer] XQueryTree failed. \n").c_str());
     return {};
   }
+  fprintf(stderr, "%s", green_text("[x11_sanitizer] found " + std::to_string(nchildren_return) + " root children\n").c_str());
+
   std::vector<CandidateWindowInfo> targets;
   for (int i = 0; i < nchildren_return; i++) {
     XWindow_t cur_window = children_return[i];
     XWindowAttributes window_attributes;
     auto xgetwindow_status = XGetWindowAttributes(display, cur_window, &window_attributes);
     if (xgetwindow_status == 0) {
-      fprintf(stderr, "%s", red_text("[x11_sanitizer] XGetWindowAttributes failed. \n").c_str());
+      fprintf(stderr, "%s", red_text("[x11_sanitizer] XGetWindowAttributes failed for window 0x" + int_to_hexstr(cur_window) + ". \n").c_str());
       continue;
     }
-    if (window_attributes.override_redirect == false) {
-      continue;
-    }
-
-    // found override_redirect window
-    // check its name
 
     std::string window_name;
     XTextProperty prop;
@@ -61,14 +58,31 @@ std::vector<CandidateWindowInfo> x11_sanitizer_get_targets(
         XFree(prop.value);
     }
 
-    // check if "wemeet" is in the window name
-    if (window_name.find("wemeet") == std::string::npos) {
+    fprintf(stderr, "%s", yellow_text("[x11_sanitizer] window 0x" + int_to_hexstr(cur_window) + ": name='" + window_name + "', override_redirect=" + std::to_string(window_attributes.override_redirect) + ", size=" + std::to_string(window_attributes.width) + "x" + std::to_string(window_attributes.height) + "\n").c_str());
+
+    // check if "屏幕共享" is in the window name (regardless of override_redirect)
+    bool is_target_window = (window_name.find("屏幕共享") != std::string::npos);
+
+    if (!is_target_window) {
       continue;
     }
 
+    // check if window size matches any screen size
+    bool size_matches_screen = false;
+    for (auto [width, height]: screen_sizes) {
+      if (window_attributes.width == width && window_attributes.height == height) {
+        size_matches_screen = true;
+        break;
+      }
+    }
+
+    if (!size_matches_screen) {
+      fprintf(stderr, "%s", yellow_text("[x11_sanitizer] window 0x" + int_to_hexstr(cur_window) + " name matches but size doesn't match any screen\n").c_str());
+      continue;
+    }
 
     // found candidate window here, add it to the list
-
+    fprintf(stderr, "%s", green_text("[x11_sanitizer] matched target window 0x" + int_to_hexstr(cur_window) + "\n").c_str());
     targets.push_back(CandidateWindowInfo{
       .window_id = cur_window,
       .window_name = window_name,
@@ -130,20 +144,29 @@ std::vector<std::tuple<int, int>> get_screen_sizes(
 
 void x11_sanitizer_main()
 {
-  // get the current session type
-  // if it's "wayland", then the x11 sanitizer can just exit
-  if (get_current_session_type() == SessionType::Wayland) {
-    fprintf(stderr, "%s", green_text("[x11_sanitizer] wayland session detected. skipping x11 sanitizer. \n").c_str());
+  auto& interface_singleton = InterfaceSingleton::getSingleton();
+
+  // Wait for interface_handle to be created
+  while(interface_singleton.interface_handle.load() == nullptr) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  auto* interface_handle = interface_singleton.interface_handle.load();
+  fprintf(stderr, "%s", green_text("[x11_sanitizer] starting, interface_handle ready\n").c_str());
+
+  Display* display = XOpenDisplay(NULL);
+
+  // If we can't open X display, there's nothing to sanitize
+  if (display == nullptr) {
+    fprintf(stderr, "%s", yellow_text("[x11_sanitizer] no X display available, skipping x11 sanitizer. \n").c_str());
     return;
   }
-  
-  auto& interface_singleton = InterfaceSingleton::getSingleton();
-  auto* interface_handle = interface_singleton.interface_handle.load();
-  Display* display = XOpenDisplay(NULL);
+
   int screen = DefaultScreen(display);
   XWindow_t root_window = DefaultRootWindow(display);
 
   std::vector<std::tuple<int, int>> screen_sizes = get_screen_sizes(display, screen);
+  fprintf(stderr, "%s", green_text("[x11_sanitizer] found " + std::to_string(screen_sizes.size()) + " screens\n").c_str());
     
   // 2 seconds steady wait time seems to be "generally safe".
   std::chrono::milliseconds STEADY_WAIT_TIME(2000);
@@ -156,7 +179,7 @@ void x11_sanitizer_main()
 
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    auto targets = x11_sanitizer_get_targets(display, root_window);
+    auto targets = x11_sanitizer_get_targets(display, root_window, screen_sizes);
     auto now = std::chrono::high_resolution_clock::now();
     if (targets.size() != 0 && target_first_occurred == false) {
       target_first_occurred = true;
@@ -283,8 +306,8 @@ void payload_main(){
   // start the gio mainloop thread
   std::thread portal_gio_mainloop_thread = payload_start_portal_gio_mainloop_thread();
 
-  // start x11 sanitizer thread
-  std::thread x11_sanitizer_thread = std::thread(x11_sanitizer_main);
+  // Note: x11_sanitizer is now started early in try_init_payload() to hide QQ's window ASAP
+  // We don't start it here anymore
 
   // start screencast session
   // this will get the pipewire fd into the portal object
@@ -293,7 +316,7 @@ void payload_main(){
     XdpScreencastPortal::screencast_session_start_cb,
     portal_handle
   );
-  
+
   // wait until pipewire_fd is up
   while(portal_handle->status.load() == XdpScreencastPortalStatus::kInit ) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -303,7 +326,6 @@ void payload_main(){
   if (portal_handle->status.load() == XdpScreencastPortalStatus::kCancelled) {
     fprintf(stderr, "%s", red_text("[payload] screencast cancelled. stop gio and join gio thread. \n").c_str());
     g_main_loop_quit(portal_handle->gio_mainloop);
-    x11_sanitizer_thread.join();
     portal_gio_mainloop_thread.join();
     return;
   }
@@ -313,20 +335,20 @@ void payload_main(){
   }
   fprintf(stderr, "%s", green_text("[payload SYNC] pipewire_fd acquired: " + std::to_string(portal_handle->pipewire_fd.load()) + "\n").c_str());
 
-  
-  while(interface_singleton.pipewire_handle.load() == nullptr){
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
-  fprintf(stderr, "%s", green_text("[payload SYNC] got pipewire_handle.\n").c_str());
+  // Create PipewireScreenCast object
+  interface_singleton.pipewire_handle = new PipewireScreenCast(
+    portal_handle->pipewire_fd.load(),
+    portal_handle->pipewire_node_ids.at(0)
+  );
+  fprintf(stderr, "%s", green_text("[payload SYNC] pipewire screencast object allocated\n").c_str());
 
   // start the pipewire thread
   std::thread pipewire_thread = payload_start_pipewire_thread();
 
-  // we can join the sanitizer thread here since the pipewire thread is up
-  // which means the user has successfully started the screenshare
+  // Signal x11_sanitizer to stop (it was started early in try_init_payload)
+  // Note: we don't join it here since it was detached
   interface_singleton.interface_handle.load()->x11_sanitizer_stop_flag.store(true, std::memory_order_seq_cst);
-  x11_sanitizer_thread.join();
-  fprintf(stderr, "%s", green_text("[payload SYNC] x11 sanitizer stopped.\n").c_str());
+  fprintf(stderr, "%s", green_text("[payload SYNC] x11 sanitizer stop signal sent.\n").c_str());
 
   pipewire_thread.join();
   interface_singleton.interface_handle.load()->payload_pw_stop_confirm.store(true, std::memory_order_seq_cst);

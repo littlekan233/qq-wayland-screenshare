@@ -37,61 +37,67 @@
 // #define STB_IMAGE_RESIZE_IMPLEMENTATION
 // #include <stb/stb_image_resize2.h>
 
+// Forward declaration
+void x11_sanitizer_main();
+
 constexpr uint32_t DEFAULT_FRAME_HEIGHT = 1080;
 constexpr uint32_t DEFAULT_FRAME_WIDTH = 1920;
 
-void XShmAttachHook(){
+namespace {
+  std::atomic<bool> payload_initialized{false};
+  std::atomic<bool> payload_init_requested{false};
+  std::atomic<int> screenshare_detection_score{0};
+}
+
+// Lazy initialization: only start payload when we detect actual screenshare activity
+static void try_init_payload() {
+  if (payload_initialized.load(std::memory_order_seq_cst)) {
+    return;
+  }
+
+  bool expected = false;
+  if (!payload_init_requested.compare_exchange_strong(expected, true, std::memory_order_seq_cst)) {
+    return; // Already being initialized
+  }
+
+  fprintf(stderr, "%s", green_text("[hook] starting payload initialization\n").c_str());
 
   auto& interface_singleton = InterfaceSingleton::getSingleton();
 
+  // Start x11_sanitizer early to hide QQ's screenshare window ASAP
+  std::thread x11_sanitizer_thread = std::thread(x11_sanitizer_main);
+  x11_sanitizer_thread.detach();
+  fprintf(stderr, "%s", green_text("[hook] x11_sanitizer thread started early\n").c_str());
+
   // initialize interface singleton:
-  // (1) allocate the interface object
   interface_singleton.interface_handle = new Interface(
     DEFAULT_FB_ALLOC_HEIGHT, DEFAULT_FB_ALLOC_WIDTH,
     DEFAULT_FRAME_HEIGHT, DEFAULT_FRAME_WIDTH, SpaVideoFormat_e::RGBA
   );
-  // (2) allocate the screencast portal object
   interface_singleton.portal_handle = new XdpScreencastPortal();
 
-  // start the payload thread
-  std::thread payload_thread = std::thread(payload_main);
-  fprintf(stderr, "%s", green_text("[hook] payload thread started\n").c_str());
+  // start the payload thread - it will handle the rest asynchronously
+  std::thread payload_thread = std::thread([]() {
+    auto& interface_singleton = InterfaceSingleton::getSingleton();
 
-  while(interface_singleton.portal_handle.load()->status.load(std::memory_order_seq_cst) == XdpScreencastPortalStatus::kInit ) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  };
-  auto payload_status = interface_singleton.portal_handle.load()->status.load(std::memory_order_seq_cst);
-  std::string payload_status_str = 
-    payload_status == XdpScreencastPortalStatus::kCancelled ? "cancelled" :
-    payload_status == XdpScreencastPortalStatus::kRunning ? "running" :
-    "unknown";
-  if (payload_status == XdpScreencastPortalStatus::kRunning) {
-    // things are good
-    fprintf(stderr, "%s", green_text("[hook] portal status: " + payload_status_str + "\n").c_str());
-  } else {
-    // things are bad, we have to de-initialize and exit
-    fprintf(stderr, "%s", red_text("[hook] portal status: " + payload_status_str + "\n").c_str());
-    fprintf(stderr, "%s", red_text("[hook] <<<!!Please DO NOT cancel screencast!!>> Hook is now exiting.\n").c_str());
-    // payload thread should have quitted via g_main_loop_quit
-    payload_thread.join();
-    delete interface_singleton.interface_handle.load();
-    delete interface_singleton.portal_handle.load();
-    interface_singleton.interface_handle.store(nullptr);
-    interface_singleton.portal_handle.store(nullptr);
-    return;
-  }
+    payload_main();
 
+    // Wait for pipewire to be ready
+    while(interface_singleton.pipewire_handle.load() == nullptr){
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
 
-  while(interface_singleton.portal_handle.load()->pipewire_fd.load(std::memory_order_seq_cst) == -1){
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
-  }
-  fprintf(stderr, "%s", green_text("[hook SYNC] pipewire_fd acquired: " + std::to_string(interface_singleton.portal_handle.load()->pipewire_fd.load()) + "\n").c_str());
-
-  interface_singleton.pipewire_handle = new PipewireScreenCast(interface_singleton.portal_handle.load()->pipewire_fd.load(), interface_singleton.portal_handle.load()->pipewire_node_ids.at(0));
-  fprintf(stderr, "%s", green_text("[hook SYNC] pipewire screencast object allocated\n").c_str());
-  
+    payload_initialized.store(true, std::memory_order_seq_cst);
+    fprintf(stderr, "%s", green_text("[hook] payload fully initialized\n").c_str());
+  });
   payload_thread.detach();
 
+  fprintf(stderr, "%s", green_text("[hook] payload thread started\n").c_str());
+}
+
+void XShmAttachHook(){
+  // Don't initialize payload here - wait for actual screenshare activity
+  fprintf(stderr, "%s", yellow_text("[hook] XShmAttach called, waiting for screenshare activity...\n").c_str());
 }
 
 template <typename T>
@@ -298,12 +304,43 @@ Bool XShmAttach(Display* dpy, XShmSegmentInfo* shminfo){
 }
 
 Bool XShmGetImage(Display* dpy, Drawable d, XImage* image, int x, int y, unsigned long plane_mask){
-  XShmGetImageHook(*image);
+  // Detect screenshare activity: large, frequent image requests
+  // Only detect if not already initialized or initializing
+  if (!payload_initialized.load(std::memory_order_seq_cst) &&
+      !payload_init_requested.load(std::memory_order_seq_cst)) {
+    bool is_large_image = (image->width >= 1280 && image->height >= 720);
+    bool is_root_window = (d == DefaultRootWindow(dpy));
+
+    if (is_large_image || is_root_window) {
+      int score = screenshare_detection_score.fetch_add(1, std::memory_order_seq_cst) + 1;
+      if (score >= 5) {
+        fprintf(stderr, "%s", green_text("[hook] screenshare activity detected, initializing payload\n").c_str());
+        try_init_payload();
+      }
+    }
+  }
+
+  // Only apply hook if payload is initialized
+  if (payload_initialized.load(std::memory_order_seq_cst)) {
+    XShmGetImageHook(*image);
+  }
   return 1;
 }
 
 Bool XShmDetach(Display* dpy, XShmSegmentInfo* shminfo){
-  XShmDetachHook();
+  // Clean up and reset state for next screenshare session
+  if (payload_initialized.load(std::memory_order_seq_cst)) {
+    fprintf(stderr, "%s", yellow_text("[hook] XShmDetach called, cleaning up resources\n").c_str());
+    XShmDetachHook();
+
+    // Reset all state flags so next screenshare can initialize properly
+    payload_initialized.store(false, std::memory_order_seq_cst);
+    payload_init_requested.store(false, std::memory_order_seq_cst);
+    screenshare_detection_score.store(0, std::memory_order_seq_cst);
+
+    fprintf(stderr, "%s", green_text("[hook] cleanup complete, ready for next screenshare session\n").c_str());
+  }
+
   return XShmDetachFunc(dpy, shminfo);
 }
 
