@@ -1,6 +1,6 @@
 # qq-wayland-screenshare 腾讯 QQ Wayland 屏幕共享
 
-感谢 @xwud1 开发的 [wemeet-wayland-screenshare](https://github.com/xwud1/wemeet-wayland-screenshare)，腾讯会议现已原生支持 Wayland 下屏幕共享。
+感谢 @xuwd1 开发的 [wemeet-wayland-screenshare](https://github.com/xuwd1/wemeet-wayland-screenshare)，腾讯会议现已原生支持 Wayland 下屏幕共享。
 
 但是，腾讯 QQ 的开发者仍然不作为，现在腾讯 QQ 仍无法实现 Wayland 下屏幕共享。本项目基于 wemeet-wayland-screenshare 的代码实现了腾讯 QQ 的 Wayland 屏幕共享。
 
@@ -11,7 +11,7 @@
 >
 > 本项目尊重上游仓库作者 @xuwd1 的成果，并将同样使用 MIT 协议开源。
 >
-> 原仓库地址：[xwud1/wemeet-wayland-screenshare](https://github.com/xwud1/wemeet-wayland-screenshare)
+> 原仓库地址：[xuwd1/wemeet-wayland-screenshare](https://github.com/xuwd1/wemeet-wayland-screenshare)
 
 ## ✨使用效果
 
@@ -171,5 +171,5 @@ sudo ninja install
 
 ## 🙏致谢
 
-- 感谢 @xuwd1 开发了 [wemeet-wayland-screenshare](https://github.com/xwud1/wemeet-wayland-screenshare)，为我们适配腾讯 QQ 提供了参考。
+- 感谢 @xuwd1 开发了 [wemeet-wayland-screenshare](https://github.com/xuwd1/wemeet-wayland-screenshare)，为我们适配腾讯 QQ 提供了参考。
 - 感谢上游仓库 wemeet-wayland-screenshare 的所有贡献者。
