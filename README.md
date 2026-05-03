@@ -21,7 +21,7 @@
 
 ![Inst1](./resource/instruction-1.png "instruction-1")
 ![Inst2](./resource/instruction-2.png "instruction-2")
-![Inst3](./resource/instruction-3-new.png "instruction-3")
+![Inst3](./resource/instruction-3.png "instruction-3")
 ![Support](./resource/supported_DEs.png "support")
 
 
@@ -64,7 +64,7 @@ ninja
 
 - 编译完成后，`build`目录下可见有`libhook.so`
 
-4. 将`libhook.so`预加载并钩住`wemeet`:
+4. 将`libhook.so`预加载并钩住`linuxqq`:
 
 ```bash
 # make sure you are in the build directory
@@ -141,29 +141,33 @@ sudo ninja install
    - 根据`falser`的反馈，**ArchLinux Hyprland** + `wireplumber`正常工作
    - 根据`novel2430`在[#9](https://github.com/xuwd1/wemeet-wayland-screenshare/issues/9)中的测试，典型的**wlroots-based DE/WM**下 (tested: sway, wayfire, labwc, river) 正常工作
    - 上述是wemeet的表现，qq的话也是都可以用的
-   - **niri 用户不能直接用！** 因为 niri 的话并未完全遵守 PipeWire 标准，会导致报错`[payload pw] stream error: no more input formats`。你需要自行编译 niri 以保证正常使用屏幕共享。[怎么整捏？ ->](#🕯-niri-环境怎么用这个lib？)
+   - **niri 用户不能直接用！** 因为 niri 的话并未完全遵守 PipeWire 标准，会导致报错`[payload pw] stream error: no more input formats`。你需要自行编译 niri 以保证正常使用屏幕共享。[怎么整捏？ ->](#-niri-环境怎么用这个库)
 
-2. 目前，本项目只基于AUR package [wemeet-bin](https://aur.archlinux.org/packages/wemeet-bin)测试过. 特别地，在纯Wayland模式下（使用`wemeet`启动），wemeet本身存在一个恶性bug：尽管搭配本项目时，Linux用户可以将屏幕共享给其他用户，但当其他用户发起屏幕共享时，wemeet则会直接崩溃. 因此，本项目推荐启动X11模式的wemeet（使用`wemeet-x11`启动）. ~~我感觉应该不会在QQ上出现，毕竟wayla~~
+2. 目前，本项目只基于AUR package [wemeet-bin](https://aur.archlinux.org/packages/wemeet-bin)测试过. 特别地，在纯Wayland模式下（使用`wemeet`启动），wemeet本身存在一个恶性bug：尽管搭配本项目时，Linux用户可以将屏幕共享给其他用户，但当其他用户发起屏幕共享时，wemeet则会直接崩溃. 因此，本项目推荐启动X11模式的wemeet（使用`wemeet-x11`启动）. ~~我感觉应该不会在腾讯QQ上出现~~
 
 - 此时，本项目仍然可以确保屏幕共享功能正常运行.
 - 而这主要得益于本项目新增加的x11 sanitizer，其会在屏幕共享时强制最小化qq的overlay（开始屏幕共享后2秒后生效），使得用户可以自由地点击包括xdg portal窗口在内的任何屏幕内容.
 
-## 🕯 niri 环境怎么用这个lib？
+## 🕯 niri 环境怎么用这个库？
 > [!NOTE]
 > 本人没试过~~因为懒~~，有误请指出
 1. 克隆niri源码。
-```bash
-git clone --recursive https://github.com/niri-wm/niri.git
-```
+
+   ```bash
+   git clone --recursive https://github.com/niri-wm/niri.git
+   ```
 2. 下载补丁并patch。
-最新的26.04版本请下载这个patch：https://github.com/wrvsrx/niri/compare/tag_support-shm-sharing_4~19..tag_support-shm-sharing_4.patch
-旧版本请查阅[此Pull Request](https://github.com/niri-wm/niri/pull/1791)。
-```bash
-# 打上patch
-git apply /path/to/shm_support.patch
-```
+
+   最新的26.04版本请下载这个patch：https://github.com/wrvsrx/niri/compare/tag_support-shm-sharing_4~19..tag_support-shm-sharing_4.patch
+
+   旧版本请查阅[此Pull Request](https://github.com/niri-wm/niri/pull/1791)。
+   ```bash
+   # 打上patch
+   git apply /path/to/shm_support.patch
+   ```
 3. 编译并安装
-这边自己看 niri 的 README 吧，不做赘述了。
+
+   这边自己看 niri 的 README 吧，不做赘述了。
 
 ## 🙏致谢
 
