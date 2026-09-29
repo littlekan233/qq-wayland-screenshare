@@ -23,6 +23,18 @@ add_library(qwlss SHARED
     x11_window.c
     portal_capture.c
     capture_controller.c
+    qwlss_shm.c
+)
+
+find_package(Threads REQUIRED)
+
+target_link_libraries(qwlss PRIVATE
+    Threads::Threads
+    rt
+)
+
+target_link_options(qwlss PRIVATE
+    "-Wl,-z,defs"
 )
 
 # 这里选择 GNU C11；如果项目有其他标准要求，可以调整。

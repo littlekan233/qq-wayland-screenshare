@@ -8,7 +8,10 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <errno.h>
+#include <inttypes.h>
 
+#include "qwlss_shm.h"
 #include "watcher.h"
 
 struct frame {
@@ -17,9 +20,6 @@ struct frame {
     int height;
     size_t stride;
 };
-
-static pthread_mutex_t frame_lock = PTHREAD_MUTEX_INITIALIZER;
-static struct frame current_frame;
 
 /*
  * 发布一帧 BGRx。
@@ -30,77 +30,41 @@ static struct frame current_frame;
  * 函数内部复制数据，不持有源 buffer。
  * 成功返回 0，失败返回 -1。
  */
-int hook_publish_bgrx(const void *src,
-                     size_t available,
-                     int width,
-                     int height,
-                     size_t stride)
+int hook_publish_bgrx(
+    const void *src,
+    size_t available,
+    int width,
+    int height,
+    size_t stride)
 {
-    if (!src || width <= 0 || height <= 0)
-        return -1;
+    int result = qwlss_shm_publish(
+        src, available, width, height, stride);
 
-    if ((size_t)width > SIZE_MAX / 4)
-        return -1;
+    int saved = errno;
 
-    size_t row_bytes = (size_t)width * 4;
+    static atomic_ulong publications = ATOMIC_VAR_INIT(0);
+    unsigned long n = atomic_fetch_add(&publications, 1) + 1;
 
-    if (stride < row_bytes)
-        return -1;
+    if (n <= 5 || n % 120 == 0) {
+        const char *name = getenv("QWLSS_SHM_NAME");
 
-    /* 检查最后一行末尾是否处于有效数据范围内。 */
-    if ((size_t)(height - 1) >
-        (SIZE_MAX - row_bytes) / stride)
-        return -1;
-
-    size_t required =
-        (size_t)(height - 1) * stride + row_bytes;
-
-    if (available < required)
-        return -1;
-
-    if ((size_t)height > SIZE_MAX / row_bytes)
-        return -1;
-
-    uint8_t *copy = malloc((size_t)height * row_bytes);
-    if (!copy)
-        return -1;
-
-    for (int y = 0; y < height; ++y) {
-        memcpy(copy + (size_t)y * row_bytes,
-               (const uint8_t *)src + (size_t)y * stride,
-               row_bytes);
+        if (result == 0) {
+            fprintf(stderr,
+                    "[shm-write pid=%ld] %s frame=%lu %dx%d\n",
+                    (long)getpid(),
+                    name ? name : "(unset)",
+                    n, width, height);
+        } else {
+            fprintf(stderr,
+                    "[shm-write pid=%ld] %s failed: %s\n",
+                    (long)getpid(),
+                    name ? name : "(unset)",
+                    strerror(saved));
+        }
     }
 
-    pthread_mutex_lock(&frame_lock);
-
-    uint8_t *old = current_frame.pixels;
-
-    current_frame = (struct frame) {
-        .pixels = copy,
-        .width = width,
-        .height = height,
-        .stride = row_bytes,
-    };
-
-    /* 放在持有 frame_lock 的区域内。 */
-    static unsigned long published = 0;
-    ++published;
-
-    if (published <= 5 || published % 120 == 0) {
-        fprintf(stderr,
-            "[cache pid=%ld] published #%lu "
-            "cache=%p size=%dx%d\n",
-            (long)getpid(),
-            published,
-            (void *)&current_frame,
-            current_frame.width,
-            current_frame.height);
-    }
-
-    pthread_mutex_unlock(&frame_lock);
-
-    free(old);
-    return 0;
+    errno = saved;
+    return result;
 }
 
 /*
@@ -109,14 +73,10 @@ int hook_publish_bgrx(const void *src,
  */
 void hook_clear_frame(void)
 {
-    pthread_mutex_lock(&frame_lock);
-
-    uint8_t *old = current_frame.pixels;
-    current_frame = (struct frame) {0};
-
-    pthread_mutex_unlock(&frame_lock);
-
-    free(old);
+    if (qwlss_shm_clear() < 0) {
+        fprintf(stderr, "[shm-clear pid=%ld] %s\n",
+                (long)getpid(), strerror(errno));
+    }
 }
 
 static int supported_image(const XImage *image)
@@ -232,12 +192,13 @@ static void render_contain(const struct frame *src,
     }
 }
 
-Bool XShmGetImage(Display *display,
-                 Drawable drawable,
-                 XImage *image,
-                 int x,
-                 int y,
-                 unsigned long plane_mask)
+Bool XShmGetImage(
+    Display *display,
+    Drawable drawable,
+    XImage *image,
+    int x,
+    int y,
+    unsigned long plane_mask)
 {
     (void)display;
     (void)drawable;
@@ -245,70 +206,65 @@ Bool XShmGetImage(Display *display,
     (void)y;
 
     static atomic_ulong calls = ATOMIC_VAR_INIT(0);
-
-    unsigned long n =
-        atomic_fetch_add_explicit(
-            &calls, 1, memory_order_relaxed) + 1;
-
-    /* 前五次，以及之后每 120 次打印一次。 */
+    unsigned long n = atomic_fetch_add(&calls, 1) + 1;
     int log_this = n <= 5 || n % 120 == 0;
-
-    if (log_this) {
-        fprintf(stderr,
-                "[hook pid=%ld] entered #%lu cache=%p\n",
-                (long)getpid(),
-                n,
-                (void *)&current_frame);
-
-        if (image) {
-            fprintf(stderr,
-                    "[hook] dst=%dx%d depth=%d bpp=%d "
-                    "stride=%d order=%d format=%d "
-                    "masks=%lx/%lx/%lx data=%p\n",
-                    image->width,
-                    image->height,
-                    image->depth,
-                    image->bits_per_pixel,
-                    image->bytes_per_line,
-                    image->byte_order,
-                    image->format,
-                    image->red_mask,
-                    image->green_mask,
-                    image->blue_mask,
-                    (void *)image->data);
-        }
-    }
 
     if (!supported_image(image)) {
         if (log_this)
-            fprintf(stderr, "[hook] rejected XImage layout\n");
-
-        return False;
-    }
-
-    pthread_mutex_lock(&frame_lock);
-
-    if (!current_frame.pixels) {
-        if (log_this)
-            fprintf(stderr, "[hook] no cached frame\n");
-
-        pthread_mutex_unlock(&frame_lock);
+            fprintf(stderr,
+                    "[hook pid=%ld] unsupported XImage\n",
+                    (long)getpid());
         return False;
     }
 
     watchdog_timer_reset();
-    render_contain(&current_frame, image, plane_mask);
+    
+    struct qwlss_snapshot snapshot = {0};
+    int status = qwlss_shm_read(&snapshot);
+
+    if (status != 1) {
+        int saved = errno;
+
+        if (log_this) {
+            const char *name = qwlss_shm_name();
+
+            fprintf(stderr,
+                    "[shm-read pid=%ld] %s: %s\n",
+                    (long)getpid(),
+                    name ? name : "(unset)",
+                    status == 0
+                        ? "no frame"
+                        : strerror(saved));
+        }
+
+        return False;
+    }
+
+    /*
+     * 这里已经释放跨进程锁。
+     * snapshot.pixels 是本次调用独占的本地内存。
+     */
+    struct frame source = {
+        .pixels = snapshot.pixels,
+        .width = snapshot.width,
+        .height = snapshot.height,
+        .stride = snapshot.stride
+    };
+
+    render_contain(&source, image, plane_mask);
 
     if (log_this) {
         fprintf(stderr,
-                "[hook] rendered %dx%d -> %dx%d; return True\n",
-                current_frame.width,
-                current_frame.height,
+                "[shm-read pid=%ld] seq=%" PRIu64
+                " rendered %dx%d -> %dx%d\n",
+                (long)getpid(),
+                snapshot.sequence,
+                snapshot.width,
+                snapshot.height,
                 image->width,
                 image->height);
     }
 
-    pthread_mutex_unlock(&frame_lock);
-
+    free(snapshot.pixels);
     return True;
 }
