@@ -3,6 +3,7 @@
 #include <xcb/xcb.h>
 
 #include <fcntl.h>
+#include <glib.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -16,6 +17,44 @@ static xcb_connection_t *conn;
 static xcb_atom_t atom_name;
 static xcb_atom_t atom_utf8;
 static int log_fd = -1;
+/* 仅由窗口监听线程访问。 */
+static GHashTable *share_windows;
+static gboolean window_capture_requested;
+
+static void track_share_window(xcb_window_t window)
+{
+    if (g_hash_table_add(
+            share_windows, GUINT_TO_POINTER(window))) {
+        fprintf(stderr,
+                "[window] track 0x%x, total=%u\n",
+                (unsigned)window,
+                g_hash_table_size(share_windows));
+    }
+}
+
+static void forget_share_window(xcb_window_t window)
+{
+    if (g_hash_table_remove(
+            share_windows, GUINT_TO_POINTER(window))) {
+        fprintf(stderr,
+                "[window] destroyed 0x%x, remaining=%u\n",
+                (unsigned)window,
+                g_hash_table_size(share_windows));
+    }
+}
+
+static void stop_if_no_share_windows(void)
+{
+    if (window_capture_requested &&
+        g_hash_table_size(share_windows) == 0) {
+        window_capture_requested = FALSE;
+
+        fprintf(stderr,
+                "[window] all tracked share windows destroyed\n");
+
+        stop_screencast();
+    }
+}
 
 static xcb_atom_t intern_atom(const char *name)
 {
@@ -112,8 +151,18 @@ static void scan_tree(
     if (!attributes)
         return;
 
-    if (window != root &&
+    int target =
+        window != root &&
         attributes->_class == XCB_WINDOW_CLASS_INPUT_OUTPUT &&
+        is_target(window);
+
+    /*
+     * 已经被我们 unmap 的窗口仍然属于这次共享。
+     * 记录不能依赖 VIEWABLE。
+     */
+    if (target)
+        track_share_window(window);
+    if (target &&
         attributes->map_state == XCB_MAP_STATE_VIEWABLE) {
 
         xcb_get_geometry_reply_t *geometry =
@@ -132,7 +181,10 @@ static void scan_tree(
                     conn, xcb_unmap_window_checked(conn, window)
                 );
 
-            if (!error) do_screencast();
+	    if (!error && !window_capture_requested) {
+                window_capture_requested = TRUE;
+                do_screencast();
+            }
             if (log_fd >= 0) {
                 if (!error) {
                     dprintf(log_fd,
@@ -220,6 +272,13 @@ static int relevant_event(const xcb_generic_event_t *event)
         return property->atom == atom_name ||
                property->atom == XCB_ATOM_WM_CLASS;
     }
+    case XCB_DESTROY_NOTIFY: {
+        const xcb_destroy_notify_event_t *destroy =
+            (const xcb_destroy_notify_event_t *)event;
+
+        forget_share_window(destroy->window);
+        return 1;
+    }
 
     default:
         /*
@@ -234,6 +293,8 @@ static void *watcher_main(void *unused)
 {
     (void)unused;
 
+    share_windows = g_hash_table_new(
+        g_direct_hash, g_direct_equal);
     conn = xcb_connect(NULL, NULL);
 
     int error = xcb_connection_has_error(conn);
@@ -279,6 +340,7 @@ static void *watcher_main(void *unused)
         if (dirty)
             scan_all();
 
+	stop_if_no_share_windows();
         if (xcb_connection_has_error(conn))
             break;
     }
@@ -287,6 +349,12 @@ static void *watcher_main(void *unused)
         dprintf(log_fd, "[stopped] X connection closed\n");
 
 done:
+    stop_screencast();
+
+    if (share_windows) {
+        g_hash_table_destroy(share_windows);
+       share_windows = NULL;
+    }
     xcb_disconnect(conn);
 
     if (log_fd >= 0) {

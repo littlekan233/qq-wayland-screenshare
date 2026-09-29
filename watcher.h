@@ -1,6 +1,10 @@
 #ifndef WATCHER_H
 #define WATCHER_H
-// 导出的两个方法供窗口监听和XShmGetImage使用。
+
+/* 异步请求开始捕获，重复调用不会重复弹出 Portal。 */
 void do_screencast(void);
-void watchdog_timer_reset(void);
+
+/* 异步请求停止，包括仍在等待用户选择的情况。 */
+void stop_screencast(void);
+
 #endif

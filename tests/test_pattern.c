@@ -12,14 +12,6 @@ extern int hook_publish_bgrx(
 );
 
 /*
- * hook.c 会调用它。
- * 色条测试不启动捕获线程，也不需要超时控制。
- */
-void watchdog_timer_reset(void)
-{
-}
-
-/*
  * 加载测试库时，在当前进程发布测试图。
  *
  * 这里没有启动线程，图像只生成一次。

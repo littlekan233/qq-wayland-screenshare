@@ -3,6 +3,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -48,7 +49,17 @@ static int valid_ipc_name(const char *name)
     if (length >= sizeof(ipc_name))
         return 0;
 
-    return strchr(name + 1, '/') == NULL;
+    for (size_t i = 1; i < length; ++i) {
+        unsigned char c = (unsigned char)name[i];
+
+        if (!((c >= 'a' && c <= 'z') ||
+              (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') ||
+              c == '-' || c == '_' || c == '.'))
+            return 0;
+    }
+
+    return 1;
 }
 
 static int random_bytes(void *buffer, size_t size)
@@ -71,6 +82,50 @@ static int random_bytes(void *buffer, size_t size)
 
         p += n;
         size -= (size_t)n;
+    }
+
+    return 0;
+}
+
+static int generate_ipc_name(void)
+{
+    unsigned char random_value[16];
+
+    if (random_bytes(random_value, sizeof(random_value)) < 0)
+        return -1;
+
+    int n = snprintf(
+        ipc_name,
+        sizeof(ipc_name),
+        "/qwlss-%lu-",
+        (unsigned long)geteuid()
+    );
+
+    if (n < 0 || (size_t)n >= sizeof(ipc_name)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+
+    size_t used = (size_t)n;
+
+    /*
+     * 每次追加一个字节的两位十六进制编码。
+     * 每次 snprintf 都会写入结尾的 NUL。
+     */
+    for (size_t i = 0; i < sizeof(random_value); ++i) {
+        n = snprintf(
+            ipc_name + used,
+            sizeof(ipc_name) - used,
+            "%02x",
+            (unsigned)random_value[i]
+        );
+
+        if (n != 2 || (size_t)n >= sizeof(ipc_name) - used) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+
+        used += (size_t)n;
     }
 
     return 0;
@@ -105,34 +160,11 @@ static void qwlss_initialize_ipc_name(void)
 
         static const char digits[] = "0123456789abcdef";
 
-        if (random_bytes(random_value, sizeof(random_value)) < 0) {
+	if (generate_ipc_name() < 0) {
             ipc_init_error = errno;
             goto failed;
         }
 
-        for (size_t i = 0; i < sizeof(random_value); ++i) {
-            hex[i * 2] = digits[random_value[i] >> 4];
-            hex[i * 2 + 1] = digits[random_value[i] & 15];
-        }
-        hex[32] = '\0';
-
-        int n = snprintf(
-            ipc_name,
-            sizeof(ipc_name),
-            "/qwlss-%lu-%s",
-            (unsigned long)geteuid(),
-            hex
-        );
-
-        if (n < 0 || (size_t)n >= sizeof(ipc_name)) {
-            ipc_init_error = ENAMETOOLONG;
-            goto failed;
-        }
-
-        /*
-         * 到这里时变量未设置或为空。
-         * setenv 会复制字符串，供后续子进程继承。
-         */
         if (setenv(QWLSS_NAME_ENV, ipc_name, 1) < 0) {
             ipc_init_error = errno;
             goto failed;
@@ -490,228 +522,6 @@ int qwlss_shm_remove(void)
     if (shm_unlink(name) < 0 && errno != ENOENT)
         return -1;
 
-    return qwlss_wd_remove();
-}
-
-// watchdog 逻辑
-#define WD_MAGIC UINT32_C(0x51574431)
-
-enum wd_state {
-    WD_OFF = 0,
-    WD_SELECTING = 1,
-    WD_ACTIVE = 2
-};
-
-enum wd_command {
-    WD_BEGIN,
-    WD_ARM,
-    WD_BEAT,
-    WD_POLL,
-    WD_EXPIRE,
-    WD_END
-};
-
-struct wd_record {
-    uint32_t magic;
-    uint32_t state;
-    uint64_t session;
-    uint64_t ticks;
-};
-
-static int wd_name(char *buffer, size_t size)
-{
-    const char *base = shared_name();
-    if (!base)
-        return -1;
-
-    int n = snprintf(buffer, size, "%s.wd", base);
-
-    if (n < 0 || (size_t)n >= size) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-
     return 0;
 }
 
-static int wd_access(
-    enum wd_command command,
-    uint64_t *session,
-    uint64_t *ticks)
-{
-    char name[224];
-
-    if (wd_name(name, sizeof(name)) < 0)
-        return -1;
-
-    int flags = O_RDWR;
-    if (command == WD_BEGIN)
-        flags |= O_CREAT;
-
-    int fd = shm_open(name, flags, 0600);
-
-    if (fd < 0) {
-        if (errno == ENOENT && command != WD_BEGIN)
-            return 0;
-        return -1;
-    }
-
-    while (flock(fd, LOCK_EX) < 0) {
-        if (errno == EINTR)
-            continue;
-
-        int saved = errno;
-        close(fd);
-        errno = saved;
-        return -1;
-    }
-
-    struct wd_record record = {
-        .magic = WD_MAGIC,
-        .state = WD_OFF,
-        .session = 0,
-        .ticks = 0
-    };
-
-    struct stat st;
-    if (fstat(fd, &st) < 0)
-        return finish(fd, -1);
-
-    if (st.st_size != 0) {
-        if (st.st_size != (off_t)sizeof(record)) {
-            errno = EPROTO;
-            return finish(fd, -1);
-        }
-
-        if (read_at(fd, &record, sizeof(record), 0) < 0)
-            return finish(fd, -1);
-
-        if (record.magic != WD_MAGIC ||
-            record.state > WD_ACTIVE) {
-            errno = EPROTO;
-            return finish(fd, -1);
-        }
-    }
-
-    /*
-     * 旧控制者不能结束新会话。
-     * BEAT 只报告当前正在发生的截图请求。
-     */
-    if (command != WD_BEGIN && command != WD_BEAT) {
-        if (!session || record.session != *session)
-            return finish(fd, 0);
-    }
-
-    switch (command) {
-    case WD_BEGIN:
-        ++record.session;
-        if (record.session == 0)
-            record.session = 1;
-
-        record.state = WD_SELECTING;
-        record.ticks = 0;
-        break;
-
-    case WD_ARM:
-        if (record.state != WD_SELECTING)
-            return finish(fd, 0);
-
-        record.state = WD_ACTIVE;
-        record.ticks = 0;
-        break;
-
-    case WD_BEAT:
-        if (record.state != WD_ACTIVE)
-            return finish(fd, 0);
-
-        ++record.ticks;
-        break;
-
-    case WD_POLL:
-        if (record.state != WD_ACTIVE)
-            return finish(fd, 0);
-
-        *ticks = record.ticks;
-        return finish(fd, 1);
-
-    case WD_EXPIRE:
-        /*
-         * 检查和关闭在同一把锁内。
-         * 如果计时判断之后又收到心跳，本次不能关闭。
-         */
-        if (record.state != WD_ACTIVE ||
-            record.ticks != *ticks)
-            return finish(fd, 0);
-
-        record.state = WD_OFF;
-        break;
-
-    case WD_END:
-        if (record.state == WD_OFF)
-            return finish(fd, 0);
-
-        record.state = WD_OFF;
-        break;
-    }
-
-    if (write_at(fd, &record, sizeof(record), 0) < 0)
-        return finish(fd, -1);
-
-    if (command == WD_BEGIN)
-        *session = record.session;
-
-    return finish(fd, 1);
-}
-
-int qwlss_wd_begin(uint64_t *session)
-{
-    if (!session) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    return wd_access(WD_BEGIN, session, NULL);
-}
-
-int qwlss_wd_arm(uint64_t session)
-{
-    return wd_access(WD_ARM, &session, NULL);
-}
-
-int qwlss_wd_beat(void)
-{
-    return wd_access(WD_BEAT, NULL, NULL);
-}
-
-int qwlss_wd_poll(uint64_t session, uint64_t *ticks)
-{
-    if (!ticks) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    return wd_access(WD_POLL, &session, ticks);
-}
-
-int qwlss_wd_expire(uint64_t session, uint64_t expected_ticks)
-{
-    return wd_access(WD_EXPIRE, &session, &expected_ticks);
-}
-
-int qwlss_wd_end(uint64_t session)
-{
-    return wd_access(WD_END, &session, NULL);
-}
-
-int qwlss_wd_remove(void)
-{
-    char name[224];
-
-    if (wd_name(name, sizeof(name)) < 0)
-        return -1;
-
-    if (shm_unlink(name) < 0 && errno != ENOENT)
-        return -1;
-
-    return 0;
-}

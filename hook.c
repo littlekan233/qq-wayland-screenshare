@@ -207,43 +207,52 @@ Bool XShmGetImage(
 
     static atomic_ulong calls = ATOMIC_VAR_INIT(0);
     unsigned long n = atomic_fetch_add(&calls, 1) + 1;
-    int log_this = n <= 5 || n % 120 == 0;
+
+    int log_this = n <= 20 || n % 120 == 0;
 
     if (!supported_image(image)) {
-        if (log_this)
+        if (log_this) {
             fprintf(stderr,
-                    "[hook pid=%ld] unsupported XImage\n",
-                    (long)getpid());
+                    "[hook pid=%ld] call=%lu unsupported XImage\n",
+                    (long)getpid(), n);
+        }
         return False;
     }
 
-    watchdog_timer_reset();
-    
     struct qwlss_snapshot snapshot = {0};
     int status = qwlss_shm_read(&snapshot);
 
-    if (status != 1) {
+    if (status == 0) {
+        /*
+         * 当前尚无有效帧。
+         * supported_image 已经检查布局和长度乘法。
+         */
+        memset(image->data, 0,
+               (size_t)image->bytes_per_line *
+               (size_t)image->height);
+
+        if (log_this) {
+            fprintf(stderr,
+                    "[hook pid=%ld] call=%lu "
+                    "waiting for frame; output black, return True\n",
+                    (long)getpid(), n);
+        }
+
+        return True;
+    }
+
+    if (status < 0) {
         int saved = errno;
 
         if (log_this) {
-            const char *name = qwlss_shm_name();
-
             fprintf(stderr,
-                    "[shm-read pid=%ld] %s: %s\n",
-                    (long)getpid(),
-                    name ? name : "(unset)",
-                    status == 0
-                        ? "no frame"
-                        : strerror(saved));
+                    "[hook pid=%ld] call=%lu shm read failed: %s\n",
+                    (long)getpid(), n, strerror(saved));
         }
 
         return False;
     }
 
-    /*
-     * 这里已经释放跨进程锁。
-     * snapshot.pixels 是本次调用独占的本地内存。
-     */
     struct frame source = {
         .pixels = snapshot.pixels,
         .width = snapshot.width,
@@ -255,9 +264,10 @@ Bool XShmGetImage(
 
     if (log_this) {
         fprintf(stderr,
-                "[shm-read pid=%ld] seq=%" PRIu64
-                " rendered %dx%d -> %dx%d\n",
+                "[hook pid=%ld] call=%lu "
+                "rendered seq=%" PRIu64 " %dx%d -> %dx%d\n",
                 (long)getpid(),
+                n,
                 snapshot.sequence,
                 snapshot.width,
                 snapshot.height,

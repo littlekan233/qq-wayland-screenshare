@@ -38,24 +38,6 @@ int qwlss_shm_clear(void);
 int qwlss_shm_remove(void);
 
 /*
- * watchdog 接口：
- *   1：操作成功
- *   0：没有活动会话、会话不匹配，或条件已变化
- *  -1：系统错误，检查 errno
- *
- * 每个 QWLSS_SHM_NAME 对应一个捕获控制者。
- */
-int qwlss_wd_begin(uint64_t *session);
-int qwlss_wd_arm(uint64_t session);
-int qwlss_wd_beat(void);
-int qwlss_wd_poll(uint64_t session, uint64_t *ticks);
-int qwlss_wd_expire(uint64_t session, uint64_t expected_ticks);
-int qwlss_wd_end(uint64_t session);
-
-/* 所有使用者退出后清理。成功返回 0，失败返回 -1。 */
-int qwlss_wd_remove(void);
-
-/*
  * 返回本进程初始化时确定的共享名称。
  * 返回值由库持有，不要修改或释放。
  * 初始化失败时返回 NULL，并设置 errno。

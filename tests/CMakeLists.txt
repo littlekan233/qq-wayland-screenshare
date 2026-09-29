@@ -122,11 +122,6 @@ target_link_options(qwlss_pattern_test PRIVATE
 # 自动在构建目录生成 watchdog 空实现。
 # 输出：libqwlss-shm-test.so
 # ------------------------------------------------------------
-set(
-    WATCHDOG_STUB
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/watchdog_stub.c"
-)
-
 file(MAKE_DIRECTORY
     "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
@@ -139,7 +134,6 @@ file(WRITE "${WATCHDOG_STUB}"
 
 add_library(qwlss_shm_test SHARED
     "${QWLSS_SOURCE_DIR}/hook.c"
-    "${WATCHDOG_STUB}"
 )
 
 set_target_properties(qwlss_shm_test PROPERTIES
@@ -175,11 +169,3 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     endforeach()
 endif()
 
-# 构建 watchdog_test
-add_executable(watchdog_test
-    "${CMAKE_CURRENT_SOURCE_DIR}/watchdog_test.c"
-)
-
-target_link_libraries(watchdog_test PRIVATE
-    qwlss_test_shm
-)

@@ -1,35 +1,42 @@
 #include <glib.h>
 
-#include <errno.h>
-#include <inttypes.h>
-#include <stdatomic.h>
+#include <stdint.h>
 #include <stdio.h>
-#include <string.h>
 #include <unistd.h>
 
 #include "watcher.h"
 #include "portal_capture.h"
 #include "capture_adapter.h"
-#include "qwlss_shm.h"
 
 extern void hook_clear_frame(void);
 
-#define STARTUP_TIMEOUT_US (15 * G_USEC_PER_SEC)
-#define IDLE_TIMEOUT_US    (3 * G_USEC_PER_SEC)
+/* 这些状态只在主进程使用，由 controller_lock 保护。 */
+static GMutex controller_lock;
+static GCond controller_cond;
+
+static gboolean worker_started;
+static gboolean capture_requested;
+static uint64_t request_revision;
 
 struct capture_run {
     struct portal_capture *portal;
     struct pw_capture *pw;
 
-    uint64_t session;
-    uint64_t last_ticks;
-    gint64 last_change_us;
-
-    gboolean armed;
-    gboolean observed_request;
+    uint64_t revision;
     gboolean finished;
-    gboolean failed;
 };
+
+static gboolean request_is_current(uint64_t revision)
+{
+    g_mutex_lock(&controller_lock);
+
+    gboolean current =
+        capture_requested &&
+        request_revision == revision;
+
+    g_mutex_unlock(&controller_lock);
+    return current;
+}
 
 static void on_portal_ready(
     void *userdata,
@@ -39,150 +46,68 @@ static void on_portal_ready(
 {
     struct capture_run *run = userdata;
 
+    /*
+     * 用户选择期间，QQ 可能已经销毁共享窗口。
+     * 此时不要再启动 PipeWire。
+     */
+    if (!request_is_current(run->revision)) {
+        if (pipewire_fd >= 0)
+            close(pipewire_fd);
+
+        run->finished = TRUE;
+        return;
+    }
+
     if (status != PORTAL_CAPTURE_OK || !stream) {
         if (pipewire_fd >= 0)
             close(pipewire_fd);
 
-        fprintf(stderr, "[watchdog] Portal cancelled/failed: %d\n",
+        fprintf(stderr,
+                "[capture] Portal cancelled/failed: %d\n",
                 status);
 
-        run->failed = TRUE;
         run->finished = TRUE;
         return;
     }
 
-    /* 此调用无论成功与否都接管 FD。 */
+    /* pw_capture_start 无论成功与否都会接管 FD。 */
     run->pw = pw_capture_start(pipewire_fd, stream);
 
     if (!run->pw) {
-        fprintf(stderr, "[watchdog] PipeWire start failed\n");
-        run->failed = TRUE;
+        fprintf(stderr, "[capture] PipeWire start failed\n");
         run->finished = TRUE;
         return;
     }
 
-    int result = qwlss_wd_arm(run->session);
-
-    if (result != 1) {
-        fprintf(stderr, "[watchdog] arm failed: %s\n",
-                result < 0 ? strerror(errno) : "session changed");
-
-        run->failed = TRUE;
-        run->finished = TRUE;
-        return;
-    }
-
-    run->armed = TRUE;
-    run->last_ticks = 0;
-    run->observed_request = FALSE;
-    run->last_change_us = g_get_monotonic_time();
-
-    fprintf(stderr,
-            "[watchdog pid=%ld] armed session=%" PRIu64 "\n",
-            (long)getpid(), run->session);
+    fprintf(stderr, "[capture] PipeWire receiver started\n");
 }
 
 static void on_portal_closed(void *userdata)
 {
     struct capture_run *run = userdata;
+
     run->finished = TRUE;
-
-    fprintf(stderr, "[watchdog] Portal session closed\n");
+    fprintf(stderr, "[capture] Portal session closed\n");
 }
 
-/* 返回 TRUE 表示应结束捕获。 */
-static gboolean check_watchdog(struct capture_run *run)
+static void run_capture_session(uint64_t revision)
 {
-    if (!run->armed)
-        return FALSE;
-
-    uint64_t ticks = 0;
-    int result = qwlss_wd_poll(run->session, &ticks);
-
-    if (result != 1) {
-        if (result < 0) {
-            fprintf(stderr, "[watchdog] poll failed: %s\n",
-                    strerror(errno));
-            run->failed = TRUE;
-        }
-        return TRUE;
-    }
-
-    gint64 now = g_get_monotonic_time();
-
-    if (ticks != run->last_ticks) {
-        if (!run->observed_request) {
-            fprintf(stderr,
-                    "[watchdog] first screenshot request, "
-                    "session=%" PRIu64 "\n",
-                    run->session);
-        }
-
-        run->observed_request = TRUE;
-        run->last_ticks = ticks;
-        run->last_change_us = now;
-        return FALSE;
-    }
-
-    gint64 timeout = run->observed_request
-        ? IDLE_TIMEOUT_US
-        : STARTUP_TIMEOUT_US;
-
-    if (now - run->last_change_us < timeout)
-        return FALSE;
-
-    /*
-     * 再次在共享锁内核对序号。
-     * 若期间收到新心跳，下轮循环重新计时。
-     */
-    result = qwlss_wd_expire(run->session, ticks);
-
-    if (result < 0) {
-        fprintf(stderr, "[watchdog] expire failed: %s\n",
-                strerror(errno));
-        run->failed = TRUE;
-        return TRUE;
-    }
-
-    if (result == 1) {
-        fprintf(stderr, "[watchdog] %s; stopping capture\n",
-                run->observed_request
-                    ? "no screenshot requests for 3 seconds"
-                    : "no screenshot requests during startup");
-
-        return TRUE;
-    }
-
-    return FALSE;
-}
-
-/*
- * 专用控制线程执行。
- * stop_flag 可为 NULL；非 NULL 时，值为 1 表示主动停止。
- */
-int capture_run_until_stop(gint *stop_flag)
-{
-    struct capture_run run = {0};
+    struct capture_run run = {
+        .revision = revision
+    };
 
     GMainContext *context = g_main_context_new();
     g_main_context_push_thread_default(context);
 
     hook_clear_frame();
 
-    if (stop_flag && g_atomic_int_get(stop_flag) == 1)
+    if (!request_is_current(revision))
         goto cleanup;
-
-    if (qwlss_wd_begin(&run.session) != 1) {
-        fprintf(stderr, "[watchdog] begin failed: %s\n",
-                strerror(errno));
-        run.failed = TRUE;
-        goto cleanup;
-    }
 
     run.portal = portal_capture_start(on_portal_ready, &run);
 
     if (!run.portal) {
-        run.failed = TRUE;
+        fprintf(stderr, "[capture] Portal initialization failed\n");
         goto cleanup;
     }
 
@@ -190,6 +115,7 @@ int capture_run_until_stop(gint *stop_flag)
         run.portal, on_portal_closed, &run);
 
     for (;;) {
+        /* 处理 Portal 异步事件，同时定期检查停止请求。 */
         for (unsigned i = 0; i < 64; ++i) {
             if (!g_main_context_iteration(context, FALSE))
                 break;
@@ -198,23 +124,15 @@ int capture_run_until_stop(gint *stop_flag)
         if (run.finished)
             break;
 
-        if (stop_flag && g_atomic_int_get(stop_flag) == 1)
+        if (!request_is_current(revision)) {
+            fprintf(stderr, "[capture] stop requested by windows\n");
             break;
-
-        if (check_watchdog(&run))
-            break;
+        }
 
         g_usleep(100000);
     }
 
 cleanup:
-    /*
-     * 先禁止继续喂本次会话。
-     * 此函数返回时已释放共享锁，不持锁清理 PipeWire。
-     */
-    if (run.session)
-        (void)qwlss_wd_end(run.session);
-
     if (run.pw)
         pw_capture_stop(run.pw);
 
@@ -226,63 +144,87 @@ cleanup:
     g_main_context_pop_thread_default(context);
     g_main_context_unref(context);
 
-    fprintf(stderr, "[watchdog] capture stopped\n");
-    return run.failed ? -1 : 0;
+    fprintf(stderr, "[capture] session stopped\n");
 }
 
-static gint capture_running = 0;
-
+/*
+ * 控制线程在进程存活期间保留。
+ * 同一时刻只运行一个捕获会话。
+ */
 static gpointer capture_worker(gpointer userdata)
 {
     (void)userdata;
 
-    int result = capture_run_until_stop(NULL);
+    uint64_t handled_revision = 0;
 
-    g_atomic_int_set(&capture_running, 0);
-    return GINT_TO_POINTER(result);
+    for (;;) {
+        g_mutex_lock(&controller_lock);
+
+        while (!capture_requested ||
+               request_revision == handled_revision) {
+            g_cond_wait(&controller_cond, &controller_lock);
+        }
+
+        uint64_t revision = request_revision;
+        handled_revision = revision;
+
+        g_mutex_unlock(&controller_lock);
+
+        run_capture_session(revision);
+    }
+
+    return NULL;
 }
 
 void do_screencast(void)
 {
-    /* 主进程内防止重复启动同一捕获会话。 */
-    if (!g_atomic_int_compare_and_exchange(
-            &capture_running, 0, 1))
-        return;
+    g_mutex_lock(&controller_lock);
 
-    GError *error = NULL;
-
-    GThread *thread = g_thread_try_new(
-        "qwlss-capture",
-        capture_worker,
-        NULL,
-        &error);
-
-    if (!thread) {
-        fprintf(stderr, "[watchdog] create thread: %s\n",
-                error ? error->message : "unknown error");
-
-        g_clear_error(&error);
-        g_atomic_int_set(&capture_running, 0);
+    if (capture_requested) {
+        g_mutex_unlock(&controller_lock);
         return;
     }
 
-    /* 不阻塞调用 do_screencast() 的窗口监听线程。 */
-    g_thread_unref(thread);
+    if (!worker_started) {
+        GError *error = NULL;
+
+        GThread *thread = g_thread_try_new(
+            "qwlss-capture",
+            capture_worker,
+            NULL,
+            &error);
+
+        if (!thread) {
+            fprintf(stderr,
+                    "[capture] create control thread failed: %s\n",
+                    error ? error->message : "unknown error");
+
+            g_clear_error(&error);
+            g_mutex_unlock(&controller_lock);
+            return;
+        }
+
+        worker_started = TRUE;
+        g_thread_unref(thread);
+    }
+
+    capture_requested = TRUE;
+    ++request_revision;
+
+    g_cond_signal(&controller_cond);
+    g_mutex_unlock(&controller_lock);
 }
 
-void watchdog_timer_reset(void)
+void stop_screencast(void)
 {
-    int result = qwlss_wd_beat();
+    g_mutex_lock(&controller_lock);
 
-    if (result < 0) {
-        int saved = errno;
+    if (capture_requested) {
+        capture_requested = FALSE;
+        ++request_revision;
 
-        static atomic_uint errors = ATOMIC_VAR_INIT(0);
-
-        if (atomic_fetch_add(&errors, 1) < 3) {
-            fprintf(stderr,
-                    "[watchdog pid=%ld] heartbeat failed: %s\n",
-                    (long)getpid(), strerror(saved));
-        }
+        g_cond_signal(&controller_cond);
     }
+
+    g_mutex_unlock(&controller_lock);
 }
