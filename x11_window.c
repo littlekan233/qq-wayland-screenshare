@@ -32,28 +32,36 @@ static void track_share_window(xcb_window_t window)
     }
 }
 
-static void forget_share_window(xcb_window_t window)
+static void forget_share_window(
+    xcb_window_t window,
+    const char *reason)
 {
-    if (g_hash_table_remove(
-            share_windows, GUINT_TO_POINTER(window))) {
-        fprintf(stderr,
-                "[window] destroyed 0x%x, remaining=%u\n",
-                (unsigned)window,
-                g_hash_table_size(share_windows));
-    }
+    if (!g_hash_table_remove(
+            share_windows, GUINT_TO_POINTER(window)))
+        return;
+
+    fprintf(stderr,
+            "[window] untrack 0x%x, reason=%s, remaining=%u\n",
+            (unsigned)window,
+            reason,
+            g_hash_table_size(share_windows));
 }
 
 static void stop_if_no_share_windows(void)
 {
-    if (window_capture_requested &&
-        g_hash_table_size(share_windows) == 0) {
-        window_capture_requested = FALSE;
+    if (!window_capture_requested)
+        return;
 
-        fprintf(stderr,
-                "[window] all tracked share windows destroyed\n");
+    if (g_hash_table_size(share_windows) != 0)
+        return;
 
-        stop_screencast();
-    }
+    window_capture_requested = FALSE;
+
+    fprintf(stderr,
+            "[window] no matching share windows remain; "
+            "stopping capture\n");
+
+    stop_screencast();
 }
 
 static xcb_atom_t intern_atom(const char *name)
@@ -157,11 +165,19 @@ static void scan_tree(
         is_target(window);
 
     /*
-     * 已经被我们 unmap 的窗口仍然属于这次共享。
-     * 记录不能依赖 VIEWABLE。
-     */
-    if (target)
+     * 集合记录的是当前仍匹配共享条件的窗口。
+     *
+     * 是否可见不影响归属：
+     * 我们主动 unmap 后，标题和 WM_CLASS 仍然匹配。
+ */
+    if (target) {
         track_share_window(window);
+    } else {
+        forget_share_window(
+            window,
+            "title/class no longer matches"
+        );
+    }
     if (target &&
         attributes->map_state == XCB_MAP_STATE_VIEWABLE) {
 
@@ -276,7 +292,7 @@ static int relevant_event(const xcb_generic_event_t *event)
         const xcb_destroy_notify_event_t *destroy =
             (const xcb_destroy_notify_event_t *)event;
 
-        forget_share_window(destroy->window);
+        forget_share_window(destroy->window, "destroyed");
         return 1;
     }
 
