@@ -317,8 +317,8 @@ portal_capture_start(portal_ready_fn callback,
         /* 单个源，不使用 MULTIPLE。 */
         XDP_SCREENCAST_FLAG_NONE,
 
-        /* 第一版不捕获光标。 */
-        XDP_CURSOR_MODE_HIDDEN,
+        /* 捕获光标。 */
+        XDP_CURSOR_MODE_EMBEDDED,
 
         /* 每次重新选择，不持久化授权。 */
         XDP_PERSIST_MODE_NONE,
