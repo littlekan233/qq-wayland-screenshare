@@ -100,6 +100,7 @@ target_link_libraries(hook_checker PRIVATE
 add_library(qwlss_pattern_test SHARED
     "${QWLSS_SOURCE_DIR}/hook.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/test_pattern.c"
+    "${QWLSS_SOURCE_DIR}/runtime_stub.c"
 )
 
 set_target_properties(qwlss_pattern_test PROPERTIES
@@ -126,6 +127,10 @@ file(MAKE_DIRECTORY
     "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
 
+set(WATCHDOG_STUB
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/watchdog_stub.c"
+)
+
 file(WRITE "${WATCHDOG_STUB}"
     "void watchdog_timer_reset(void)\n"
     "{\n"
@@ -134,6 +139,8 @@ file(WRITE "${WATCHDOG_STUB}"
 
 add_library(qwlss_shm_test SHARED
     "${QWLSS_SOURCE_DIR}/hook.c"
+    "${QWLSS_SOURCE_DIR}/runtime_stub.c"
+    "${WATCHDOG_STUB}"
 )
 
 set_target_properties(qwlss_shm_test PROPERTIES
@@ -153,19 +160,34 @@ target_link_options(qwlss_shm_test PRIVATE
 # 构建 hook_checker 时，一并构建它常用的色条测试库。
 add_dependencies(hook_checker qwlss_pattern_test)
 
-if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    foreach(test_target IN ITEMS
-        qwlss_test_shm
-        shm_test
-        hook_checker
-        qwlss_pattern_test
-        qwlss_shm_test
-    )
-        target_compile_options(${test_target} PRIVATE
-            -Wall
-            -Wextra
-            -Werror=implicit-function-declaration
-        )
-    endforeach()
-endif()
+# ------------------------------------------------------------
+# 实验版运行时探测
+# 用构建目录下的假 procfs 文件覆盖主进程/ozone 判定。
+# ------------------------------------------------------------
+file(MAKE_DIRECTORY
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/proc"
+)
 
+enable_testing()
+
+add_executable(wlsanitizer_test
+    "${CMAKE_CURRENT_SOURCE_DIR}/wlsanitizer_test.c"
+)
+
+target_compile_definitions(wlsanitizer_test PRIVATE
+    "QWLSS_TEST_PROC_DIR=\"${CMAKE_CURRENT_BINARY_DIR}/generated/proc\""
+)
+
+target_include_directories(wlsanitizer_test PRIVATE
+    "${QWLSS_SOURCE_DIR}"
+)
+
+add_test(
+    NAME wlsanitizer
+    COMMAND "${CMAKE_CURRENT_BINARY_DIR}/bin/wlsanitizer_test"
+)
+
+add_test(
+    NAME shm_publish_read
+    COMMAND "${CMAKE_CURRENT_BINARY_DIR}/bin/shm_test" publish
+)

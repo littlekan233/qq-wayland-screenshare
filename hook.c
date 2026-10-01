@@ -12,6 +12,7 @@
 #include <inttypes.h>
 
 #include "qwlss_shm.h"
+#include "activity.h"
 #include "watcher.h"
 
 struct frame {
@@ -148,12 +149,80 @@ static void render_contain(const struct frame *src,
     int offset_x = (dw - out_w) / 2;
     int offset_y = (dh - out_h) / 2;
 
+    uint32_t mask =
+        (uint32_t)plane_mask & 0x00ffffffu;
+
+    /*
+     * 1:1 且源/目标布局一致时整块拷贝。
+     * 共享画面通常就是同尺寸同 stride，这条路径占绝大多数，
+     * 可省掉逐像素循环(原先每帧约 width*height 次整数除法)。
+     */
+    if (out_w == dw && out_h == dh &&
+        out_w == src->width && out_h == src->height &&
+        dst->bytes_per_line == (int)src->stride &&
+        mask == 0x00ffffffu) {
+        memcpy(dst->data, src->pixels,
+               (size_t)src->stride * (size_t)src->height);
+        return;
+    }
+
     /* 先填黑，也清零行尾 padding。 */
     memset(dst->data, 0,
            (size_t)dst->bytes_per_line * dh);
 
-    uint32_t mask =
-        (uint32_t)plane_mask & 0x00ffffffu;
+    /* 无缩放但有黑边: 按行拷贝，不做逐像素映射。 */
+    if (out_w == src->width && out_h == src->height) {
+        for (int y = 0; y < out_h; ++y) {
+            const uint8_t *src_row =
+                src->pixels + (size_t)y * src->stride;
+
+            uint8_t *dst_row =
+                (uint8_t *)dst->data +
+                (size_t)(offset_y + y) * dst->bytes_per_line +
+                (size_t)offset_x * 4;
+
+            if (mask == 0x00ffffffu) {
+                memcpy(dst_row, src_row, (size_t)out_w * 4);
+                continue;
+            }
+
+            for (int x = 0; x < out_w; ++x) {
+                const uint8_t *p = src_row + (size_t)x * 4;
+                uint8_t *q = dst_row + (size_t)x * 4;
+
+                uint32_t pixel =
+                    (uint32_t)p[0] |
+                    ((uint32_t)p[1] << 8) |
+                    ((uint32_t)p[2] << 16);
+
+                pixel &= mask;
+
+                q[0] = (uint8_t)pixel;
+                q[1] = (uint8_t)(pixel >> 8);
+                q[2] = (uint8_t)(pixel >> 16);
+                q[3] = 0;
+            }
+        }
+
+        return;
+    }
+
+    /*
+     * 缩放路径: 每列的源坐标只与 x 有关，先算一次，
+     * 避免逐像素整数除法。
+     */
+    int *xmap = malloc(sizeof(int) * (size_t)out_w);
+
+    if (!xmap) {
+        /* 极端情况: 分配失败则保持已清零的黑帧。 */
+        return;
+    }
+
+    for (int x = 0; x < out_w; ++x) {
+        xmap[x] = (int)(
+            (int64_t)x * src->width / out_w
+        );
+    }
 
     for (int y = 0; y < out_h; ++y) {
         int sy = (int)(
@@ -169,11 +238,7 @@ static void render_contain(const struct frame *src,
             (size_t)offset_x * 4;
 
         for (int x = 0; x < out_w; ++x) {
-            int sx = (int)(
-                (int64_t)x * src->width / out_w
-            );
-
-            const uint8_t *p = src_row + (size_t)sx * 4;
+            const uint8_t *p = src_row + (size_t)xmap[x] * 4;
             uint8_t *q = dst_row + (size_t)x * 4;
 
             uint32_t pixel =
@@ -190,6 +255,8 @@ static void render_contain(const struct frame *src,
             q[3] = 0;
         }
     }
+
+    free(xmap);
 }
 
 Bool XShmGetImage(
@@ -208,7 +275,19 @@ Bool XShmGetImage(
     static atomic_ulong calls = ATOMIC_VAR_INIT(0);
     unsigned long n = atomic_fetch_add(&calls, 1) + 1;
 
+    /*
+     * 上报最近一次取帧。注意: 选择共享目标的预览阶段也会走到这里，
+     * 所以带上尺寸，由主进程判断是否达到屏幕量级再启动捕获。
+     */
+    qwlss_activity_mark(image->width, image->height);
+
     int log_this = n <= 20 || n % 120 == 0;
+
+    if (log_this) {
+        fprintf(stderr,
+                "[hook pid=%ld] call=%lu image=%dx%d\n",
+                (long)getpid(), n, image->width, image->height);
+    }
 
     if (!supported_image(image)) {
         if (log_this) {

@@ -43,4 +43,6 @@ int qwlss_shm_remove(void);
  * 初始化失败时返回 NULL，并设置 errno。
  */
 const char *qwlss_shm_name(void);
+
+
 #endif

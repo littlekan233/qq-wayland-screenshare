@@ -1,16 +1,22 @@
 #define _GNU_SOURCE
 
 #include <xcb/xcb.h>
+#include <xcb/randr.h>
 
 #include <fcntl.h>
 #include <glib.h>
+#include <inttypes.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
+#include "qwlss_shm.h"
+#include "activity.h"
+#include "runtime.h"
 #include "watcher.h"
 
 static xcb_connection_t *conn;
@@ -130,6 +136,47 @@ static int is_target(xcb_window_t window)
            );
 }
 
+/*
+ * 判断窗口是否"铺满一块屏幕"。
+ * 单显示器时就是整个 X screen；多显示器(Xwayland)下 QQ 的大蓝框
+ * 只覆盖它所在的那块显示器，所以还要和 RandR 的 monitor 矩形比较。
+ */
+static int covers_screen_or_monitor(
+    xcb_window_t root,
+    uint16_t width,
+    uint16_t height,
+    uint16_t root_width,
+    uint16_t root_height
+)
+{
+    if (width == root_width && height == root_height)
+        return 1;
+
+    xcb_randr_get_monitors_reply_t *reply =
+        xcb_randr_get_monitors_reply(
+            conn,
+            xcb_randr_get_monitors(conn, root, 1),
+            NULL
+        );
+
+    if (!reply)
+        return 0;
+
+    int matches = 0;
+    xcb_randr_monitor_info_iterator_t it =
+        xcb_randr_get_monitors_monitors_iterator(reply);
+
+    for (; it.rem; xcb_randr_monitor_info_next(&it)) {
+        if (it.data->width == width && it.data->height == height) {
+            matches = 1;
+            break;
+        }
+    }
+
+    free(reply);
+    return matches;
+}
+
 static void scan_tree(
     xcb_window_t window,
     xcb_window_t root,
@@ -187,8 +234,8 @@ static void scan_tree(
             );
 
         if (geometry &&
-            geometry->width == root_width &&
-            geometry->height == root_height &&
+            covers_screen_or_monitor(root, geometry->width, geometry->height,
+                                     root_width, root_height) &&
             is_target(window)) {
 
             /* checked 请求，让日志能区分成功处理和窗口已销毁。 */
@@ -428,6 +475,72 @@ static int is_qq_main_process(void)
     return 1;
 }
 
+/*
+ * Wayland ozone 兼容: QQ 的共享窗口不再是 X11 窗口，watcher 看不到。
+ * PPAPI 子进程仍在调用 XShmGetImage，因此以该活动信号作为
+ * "共享开始/结束" 的触发器。X11 ozone 下这个线程只是重复确认，
+ * do_screencast 可重入、stop_screencast 幂等，不会冲突。
+ */
+static uint64_t monotonic_usec(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+        return 0;
+
+    return (uint64_t)ts.tv_sec * UINT64_C(1000000) +
+           (uint64_t)(ts.tv_nsec / 1000);
+}
+
+static void *activity_trigger_main(void *unused)
+{
+    (void)unused;
+
+    /* qwlss_activity_mark 已过滤掉预览小图；这里仅负责时间生命周期。 */
+    const uint64_t active_window_usec = UINT64_C(2000000);
+    const uint64_t idle_stop_usec = UINT64_C(3000000);
+    uint32_t last_w = 0;
+    uint32_t last_h = 0;
+    int idle_reported = 0;
+
+    for (;;) {
+        usleep(200000);
+
+        uint64_t last = 0;
+        uint32_t w = 0;
+        uint32_t h = 0;
+
+        if (!qwlss_activity_snapshot(&last, &w, &h))
+            continue;
+
+        uint64_t age = monotonic_usec() - last;
+
+        if (age <= active_window_usec) {
+            idle_reported = 0;
+
+            if (w != last_w || h != last_h) {
+                fprintf(stderr,
+                        "[capture] activity %ux%u; starting capture\n",
+                        w, h);
+                last_w = w;
+                last_h = h;
+            }
+
+            do_screencast();
+        } else if (age >= idle_stop_usec && !idle_reported) {
+            idle_reported = 1;
+            last_w = 0;
+            last_h = 0;
+
+            fprintf(stderr,
+                    "[capture] XShmGetImage idle; stopping capture\n");
+            stop_screencast();
+        }
+    }
+
+    return NULL;
+}
+
 __attribute__((constructor))
 static void start_watcher(void)
 {
@@ -437,6 +550,14 @@ static void start_watcher(void)
     char path[128];
 
     // TODO: logger implementation
+
+    /*
+     * Wayland ozone: QQ 的共享窗口是 Wayland surface，X11 watcher 看不到，
+     * 但 PPAPI 仍然会持续调用 XShmGetImage。此时用活动信号驱动采集的
+     * 生命周期，并由实验版处理共享边框。
+     */
+    if (qwlss_uses_wayland())
+        goto activity;
 
     pthread_t thread;
     int error = pthread_create(&thread, NULL, watcher_main, NULL);
@@ -452,4 +573,18 @@ static void start_watcher(void)
     }
 
     pthread_detach(thread);
+
+activity:;
+    pthread_t trigger;
+    int trigger_error =
+        pthread_create(&trigger, NULL, activity_trigger_main, NULL);
+
+    if (trigger_error) {
+        fprintf(stderr,
+                "[capture] activity trigger thread failed: %s\n",
+                strerror(trigger_error));
+        return;
+    }
+
+    pthread_detach(trigger);
 }

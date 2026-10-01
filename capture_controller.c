@@ -2,6 +2,7 @@
 
 #include "portal_capture.h"
 #include "capture_adapter.h"
+#include "runtime.h"
 
 extern void hook_clear_frame(void);
 
@@ -33,8 +34,13 @@ static void on_portal_ready(
      */
     c->pipewire = pw_capture_start(pipewire_fd, stream);
 
-    if (!c->pipewire)
+    if (!c->pipewire) {
         hook_clear_frame();
+        return;
+    }
+
+    /* 接收器已建立；供实验版判断是否可以处理共享边框。 */
+    qwlss_capture_ready(1);
 }
 
 static void on_portal_closed(void *userdata)
@@ -46,6 +52,7 @@ static void on_portal_closed(void *userdata)
         c->pipewire = NULL;
     }
 
+    qwlss_capture_ready(0);
     hook_clear_frame();
 }
 
@@ -93,5 +100,6 @@ void capture_controller_stop(struct capture_controller *c)
     }
 
     c->starting = 0;
+    qwlss_capture_ready(0);
     hook_clear_frame();
 }
