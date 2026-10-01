@@ -25,6 +25,7 @@ set(QWLSS_SOURCES
     portal_capture.c
     capture_controller.c
     qwlss_shm.c
+    mesa_workaround.c
 )
 
 # 由 wlsanitizer.js 生成内嵌脚本头文件，测试目录也会复用。

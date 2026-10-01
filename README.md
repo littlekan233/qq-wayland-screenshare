@@ -89,6 +89,15 @@ LD_PRELOAD=/path/to/libqwlss-exp-wlsanitizer.so XDG_SESSION_TYPE=x11 /opt/QQ/qq 
 
 当发起屏幕共享时，请在 QQ 的选择共享内容中选择 桌面1，然后在 XDG Portal 窗口中选择你要共享的内容。
 
+### 点「确定」后没有反应（Mesa 着色器缓存崩溃）
+
+QQ 的 `libAVSDKPlugin.so` 打包并导出了自己的 zstd（`ZSTD_*` 符号）。共享屏幕时 QQ 初始化 OpenGL，
+Mesa 读取磁盘着色器缓存会调用系统 libzstd，而 libzstd 内部调用被 QQ 那份同名符号截走，
+采集进程（`--type=ppapi`）随即崩溃（`coredumpctl` 可见 SIGTRAP，调用栈含 `ZSTD_decompressDCtx` / `libgallium`）。
+
+两个库现在都会在加载时设置 `MESA_SHADER_CACHE_DISABLE=true`（已显式设置时不覆盖），无需手动处理。
+使用旧版本库时，可在启动命令里自行加上该环境变量。
+
 ### 实验版做了什么
 
 Wayland ozone 下 QQ 的“屏幕共享”大边框是一个独立的窗口，会占满一层平铺布局。
